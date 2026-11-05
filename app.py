@@ -1,16 +1,53 @@
+import hmac
 import json
 import os
+import re
+import secrets
 import sqlite3
 from contextlib import contextmanager
+from functools import wraps
 from pathlib import Path
+from urllib.parse import urlsplit
 
-from flask import Flask, abort, redirect, render_template_string, request, url_for
+from flask import (
+    Flask,
+    abort,
+    flash,
+    redirect,
+    render_template_string,
+    request,
+    session,
+    url_for,
+)
+from werkzeug.security import check_password_hash, generate_password_hash
 
 from question_bank import QUESTION_BANK
 
 app = Flask(__name__)
 app.config["DATABASE"] = os.environ.get(
     "MATH_APP_DB", str(Path(__file__).with_name("learning.db"))
+)
+database_path = Path(app.config["DATABASE"])
+secret_path = Path(
+    os.environ.get("MATH_APP_SECRET_FILE", str(database_path.with_name(".flask_secret")))
+)
+secret_path.parent.mkdir(parents=True, exist_ok=True)
+try:
+    secret_fd = os.open(
+        secret_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
+    )
+except FileExistsError:
+    pass
+else:
+    with os.fdopen(secret_fd, "w", encoding="utf-8") as secret_file:
+        secret_file.write(secrets.token_hex(32))
+app.secret_key = os.environ.get("FLASK_SECRET_KEY") or secret_path.read_text(
+    encoding="utf-8"
+).strip()
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=os.environ.get("SESSION_COOKIE_SECURE") == "1",
 )
 
 COURSE = [
@@ -278,7 +315,16 @@ HOME_PAGE = """
 <!doctype html>
 <html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>수학 스텝업</title>""" + BASE_STYLE + """</head><body>
-<header><a href="{{ url_for('home') }}">수학 스텝업</a></header>
+<header><a href="{{ url_for('home') }}">수학 스텝업</a>
+  <span class="meta"> · {{ session_username }}</span>
+  <form method="post" action="{{ url_for('logout') }}" style="display:inline">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button type="submit">로그아웃</button>
+  </form>
+</header>
+{% for category, message in get_flashed_messages(with_categories=true) %}
+  <p class="notice {% if category == 'error' %}error{% endif %}">{{ message }}</p>
+{% endfor %}
 <section class="hero">
   <span class="badge">나의 학습 계획</span>
   <h1>미적분부터 공학수학까지, 한 단계씩</h1>
@@ -315,7 +361,16 @@ LESSON_PAGE = """
 <!doctype html>
 <html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{{ lesson['title'] }} - 수학 스텝업</title>""" + BASE_STYLE + """</head><body>
-<header><a href="{{ url_for('home') }}">← 전체 학습 단계</a></header>
+<header><a href="{{ url_for('home') }}">← 전체 학습 단계</a>
+  <span class="meta"> · {{ session_username }}</span>
+  <form method="post" action="{{ url_for('logout') }}" style="display:inline">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button type="submit">로그아웃</button>
+  </form>
+</header>
+{% for category, message in get_flashed_messages(with_categories=true) %}
+  <p class="notice {% if category == 'error' %}error{% endif %}">{{ message }}</p>
+{% endfor %}
 <main class="hero">
   <span class="badge">{{ lesson['module'] }}</span>
   <h1>{{ lesson['title'] }}</h1>
@@ -333,6 +388,7 @@ LESSON_PAGE = """
     <article class="question-card">
       <h4>{{ loop.index }}. {{ question['prompt'] }}</h4>
       <form method="post" action="{{ url_for('submit_quiz', slug=lesson['slug']) }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <input type="hidden" name="question_id" value="{{ question['id'] }}">
         <div class="choices">
         {% for choice in question['choices'] %}
@@ -363,10 +419,45 @@ LESSON_PAGE = """
   <h2>이전 학습 기록</h2>
   {% if attempts %}
   <ul>{% for attempt in attempts %}
-    <li>{{ attempt['created_at'] }} · {{ attempt['difficulty'] }} {{ attempt['question_position'] }}번 · {{ '정답' if attempt['is_correct'] else '오답' }}</li>
+    <li>{{ attempt['created_at'] }} · {{ attempt['difficulty'] or '이전' }} {{ attempt['question_position'] or '' }}{% if attempt['question_position'] %}번{% endif %} · {{ '정답' if attempt['is_correct'] else '오답' }}</li>
   {% endfor %}</ul>
   {% else %}<p class="muted">아직 제출한 답안이 없습니다.</p>{% endif %}
 </section>
+</body></html>
+"""
+
+AUTH_PAGE = """
+<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ '가입' if mode == 'register' else '로그인' }} - 수학 스텝업</title>""" + BASE_STYLE + """</head><body>
+<header><a href="{{ url_for('login') }}">수학 스텝업</a></header>
+<main class="panel">
+  <h1>{{ '계정 만들기' if mode == 'register' else '로그인' }}</h1>
+  {% if not request.is_secure %}
+  <p class="notice error">현재 HTTP 연결입니다. 실습용 비밀번호만 사용하고, 다른 서비스에서 쓰는 비밀번호는 입력하지 마세요. 실제 사용자 계정은 HTTPS 설정 후 이용해야 합니다.</p>
+  {% endif %}
+  {% for category, message in get_flashed_messages(with_categories=true) %}
+    <p class="notice {% if category == 'error' %}error{% endif %}">{{ message }}</p>
+  {% endfor %}
+  {% if error %}<p class="notice error">{{ error }}</p>{% endif %}
+  <form method="post">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <p><label>아이디 (영문, 숫자, 밑줄 / 3~32자)<br>
+      <input name="username" minlength="3" maxlength="32" pattern="[A-Za-z0-9_]{3,32}" required autocomplete="username">
+    </label></p>
+    <p><label>비밀번호 (12자 이상)<br>
+      <input type="password" name="password" minlength="12" maxlength="256" required
+        autocomplete="{{ 'new-password' if mode == 'register' else 'current-password' }}">
+    </label></p>
+    {% if mode == 'login' %}<input type="hidden" name="next" value="{{ next_url }}">{% endif %}
+    <button type="submit">{{ '가입하고 시작하기' if mode == 'register' else '로그인' }}</button>
+  </form>
+  {% if mode == 'register' %}
+    <p>이미 계정이 있나요? <a href="{{ url_for('login') }}">로그인</a></p>
+  {% else %}
+    <p>계정이 없나요? <a href="{{ url_for('register') }}">회원가입</a></p>
+  {% endif %}
+</main>
 </body></html>
 """
 
@@ -437,6 +528,37 @@ def init_db():
                 explanation TEXT NOT NULL,
                 UNIQUE (lesson_id, difficulty, position)
             );
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL COLLATE NOCASE UNIQUE,
+                password_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS user_profiles (
+                user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                level TEXT NOT NULL,
+                goal TEXT NOT NULL,
+                study_time TEXT NOT NULL,
+                data_scope TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS user_progress (
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                lesson_id INTEGER NOT NULL REFERENCES lessons(id) ON DELETE CASCADE,
+                completed INTEGER NOT NULL DEFAULT 0 CHECK (completed IN (0, 1)),
+                completed_at TEXT,
+                PRIMARY KEY (user_id, lesson_id)
+            );
+            CREATE TABLE IF NOT EXISTS user_quiz_attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                lesson_id INTEGER NOT NULL REFERENCES lessons(id) ON DELETE CASCADE,
+                question_id INTEGER REFERENCES lesson_questions(id) ON DELETE SET NULL,
+                selected_answer INTEGER NOT NULL,
+                is_correct INTEGER NOT NULL CHECK (is_correct IN (0, 1)),
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_user_quiz_attempts_question
+                ON user_quiz_attempts (user_id, question_id, id);
             """
         )
         attempt_columns = {
@@ -509,6 +631,30 @@ def init_db():
         )
 
 
+def initialize_user_data(db, user_id):
+    profile = db.execute(
+        "SELECT level, goal, study_time, data_scope FROM learner_profile WHERE id = 1"
+    ).fetchone()
+    if profile is None:
+        profile = (
+            "고등수학 기초부터",
+            "공학수학 독학, AI/머신러닝 수학 기초",
+            "1시간",
+            "학습 프로필, 단원 진도, 퀴즈 점수",
+        )
+    db.execute(
+        """
+        INSERT INTO user_profiles (user_id, level, goal, study_time, data_scope)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (user_id, *profile),
+    )
+    db.execute(
+        "INSERT INTO user_progress (user_id, lesson_id) SELECT ?, id FROM lessons",
+        (user_id,),
+    )
+
+
 def load_lesson(row):
     lesson = dict(row)
     lesson["content"] = json.loads(lesson.pop("content_json"))
@@ -519,19 +665,171 @@ def load_lesson(row):
 init_db()
 
 
+def login_required(view):
+    @wraps(view)
+    def wrapped_view(**kwargs):
+        if "user_id" not in session:
+            return redirect(url_for("login", next=request.full_path))
+        return view(**kwargs)
+
+    return wrapped_view
+
+
+def csrf_protect(view):
+    @wraps(view)
+    def wrapped_view(**kwargs):
+        if request.method == "POST":
+            submitted_token = request.form.get("csrf_token", "")
+            expected_token = session.get("_csrf_token", "")
+            if not expected_token or not hmac.compare_digest(
+                submitted_token.encode("utf-8"), expected_token.encode("utf-8")
+            ):
+                abort(
+                    400,
+                    description="요청 검증에 실패했습니다. 페이지를 새로고침해 주세요.",
+                )
+        return view(**kwargs)
+
+    return wrapped_view
+
+
+@app.context_processor
+def inject_template_context():
+    if "_csrf_token" not in session:
+        session["_csrf_token"] = secrets.token_urlsafe(32)
+    return {
+        "csrf_token": session["_csrf_token"],
+        "session_username": session.get("username"),
+    }
+
+
+def safe_next_url(target):
+    parsed = urlsplit(target)
+    if (
+        "\\" in target
+        or parsed.scheme
+        or parsed.netloc
+        or not parsed.path.startswith("/")
+        or parsed.path.startswith("//")
+    ):
+        return ""
+    return target
+
+
+@app.route("/register", methods=["GET", "POST"])
+@csrf_protect
+def register():
+    if "user_id" in session:
+        return redirect(url_for("home"))
+    if request.method == "GET":
+        return render_template_string(AUTH_PAGE, mode="register", error=None, next_url="")
+
+    username = request.form.get("username", "").strip().lower()
+    password = request.form.get("password", "")
+    if not re.fullmatch(r"[a-z0-9_]{3,32}", username):
+        return render_template_string(
+            AUTH_PAGE,
+            mode="register",
+            error="아이디는 영문 소문자, 숫자, 밑줄로 3~32자여야 합니다.",
+            next_url="",
+        ), 400
+    if not 12 <= len(password) <= 256:
+        return render_template_string(
+            AUTH_PAGE,
+            mode="register",
+            error="비밀번호는 12~256자로 입력해 주세요.",
+            next_url="",
+        ), 400
+
+    with database() as db:
+        existing_user = db.execute(
+            "SELECT 1 FROM users WHERE username = ?", (username,)
+        ).fetchone()
+        if existing_user:
+            return render_template_string(
+                AUTH_PAGE,
+                mode="register",
+                error="이미 사용 중인 아이디입니다.",
+                next_url="",
+            ), 409
+        cursor = db.execute(
+            "INSERT INTO users (username, password_hash) VALUES (?, ?)",
+            (username, generate_password_hash(password)),
+        )
+        user_id = cursor.lastrowid
+        initialize_user_data(db, user_id)
+
+    session.clear()
+    session["user_id"] = user_id
+    session["username"] = username
+    flash("가입이 완료됐어요. 나만의 학습 진도를 시작해 보세요.")
+    return redirect(url_for("home"))
+
+
+@app.route("/login", methods=["GET", "POST"])
+@csrf_protect
+def login():
+    if "user_id" in session:
+        return redirect(url_for("home"))
+    next_url = safe_next_url(request.values.get("next", ""))
+    if request.method == "GET":
+        return render_template_string(
+            AUTH_PAGE, mode="login", error=None, next_url=next_url
+        )
+
+    username = request.form.get("username", "").strip().lower()
+    password = request.form.get("password", "")
+    with database() as db:
+        user = db.execute(
+            "SELECT id, username, password_hash FROM users WHERE username = ?",
+            (username,),
+        ).fetchone()
+    if user is None or not check_password_hash(user["password_hash"], password):
+        return render_template_string(
+            AUTH_PAGE,
+            mode="login",
+            error="아이디 또는 비밀번호를 확인해 주세요.",
+            next_url=next_url,
+        ), 401
+
+    session.clear()
+    session["user_id"] = user["id"]
+    session["username"] = user["username"]
+    return redirect(next_url or url_for("home"))
+
+
+@app.route("/logout", methods=["POST"])
+@csrf_protect
+@login_required
+def logout():
+    session.clear()
+    flash("로그아웃했습니다.")
+    return redirect(url_for("login"))
+
+
 @app.route("/")
+@login_required
 def home():
     with database() as db:
-        profile = db.execute("SELECT * FROM learner_profile WHERE id = 1").fetchone()
+        user_id = session["user_id"]
+        profile = db.execute(
+            "SELECT * FROM user_profiles WHERE user_id = ?", (user_id,)
+        ).fetchone()
         rows = db.execute(
             """
             SELECT lessons.slug, lessons.module, lessons.title, lessons.summary,
-                   progress.completed
-            FROM lessons JOIN progress ON progress.lesson_id = lessons.id
+                   user_progress.completed
+            FROM lessons
+            JOIN user_progress
+              ON user_progress.lesson_id = lessons.id
+             AND user_progress.user_id = ?
             ORDER BY lessons.position
-            """
+            """,
+            (user_id,),
         ).fetchall()
-        attempt_count = db.execute("SELECT COUNT(*) FROM quiz_attempts").fetchone()[0]
+        attempt_count = db.execute(
+            "SELECT COUNT(*) FROM user_quiz_attempts WHERE user_id = ?", (user_id,)
+        ).fetchone()[0]
 
     grouped = {}
     for row in rows:
@@ -553,29 +851,35 @@ def home():
 
 
 @app.route("/lessons/<slug>")
+@login_required
 def lesson_page(slug):
+    user_id = session["user_id"]
     with database() as db:
         row = db.execute(
             """
-            SELECT lessons.*, progress.completed
-            FROM lessons JOIN progress ON progress.lesson_id = lessons.id
+            SELECT lessons.*, user_progress.completed
+            FROM lessons
+            JOIN user_progress
+              ON user_progress.lesson_id = lessons.id
+             AND user_progress.user_id = ?
             WHERE lessons.slug = ?
             """,
-            (slug,),
+            (user_id, slug),
         ).fetchone()
         if row is None:
             abort(404)
         lesson = load_lesson(row)
         attempts = db.execute(
             """
-            SELECT quiz_attempts.is_correct, quiz_attempts.created_at,
+            SELECT user_quiz_attempts.is_correct, user_quiz_attempts.created_at,
                    lesson_questions.difficulty, lesson_questions.position
-            FROM quiz_attempts
-            JOIN lesson_questions ON lesson_questions.id = quiz_attempts.question_id
-            WHERE quiz_attempts.lesson_id = (SELECT id FROM lessons WHERE slug = ?)
-            ORDER BY quiz_attempts.id DESC LIMIT 10
+            FROM user_quiz_attempts
+            LEFT JOIN lesson_questions ON lesson_questions.id = user_quiz_attempts.question_id
+            WHERE user_quiz_attempts.user_id = ?
+              AND user_quiz_attempts.lesson_id = (SELECT id FROM lessons WHERE slug = ?)
+            ORDER BY user_quiz_attempts.id DESC LIMIT 10
             """,
-            (slug,),
+            (user_id, slug),
         ).fetchall()
         question_rows = db.execute(
             """
@@ -585,10 +889,10 @@ def lesson_page(slug):
             FROM lesson_questions
             LEFT JOIN (
                 SELECT question_id, selected_answer, is_correct
-                FROM quiz_attempts
+                FROM user_quiz_attempts
                 WHERE id IN (
-                    SELECT MAX(id) FROM quiz_attempts
-                    WHERE question_id IS NOT NULL GROUP BY question_id
+                    SELECT MAX(id) FROM user_quiz_attempts
+                    WHERE user_id = ? AND question_id IS NOT NULL GROUP BY question_id
                 )
             ) AS latest ON latest.question_id = lesson_questions.id
             WHERE lesson_questions.lesson_id = (
@@ -600,7 +904,7 @@ def lesson_page(slug):
                 END,
                 lesson_questions.position
             """,
-            (slug,),
+            (user_id, slug),
         ).fetchall()
 
     difficulties = ("쉬움", "중간", "어려움")
@@ -629,6 +933,8 @@ def lesson_page(slug):
 
 
 @app.route("/lessons/<slug>/quiz", methods=["POST"])
+@csrf_protect
+@login_required
 def submit_quiz(slug):
     answer_value = request.form.get("answer", "")
     question_value = request.form.get("question_id", "")
@@ -655,11 +961,12 @@ def submit_quiz(slug):
         is_correct = selected_answer == question_row["answer"]
         db.execute(
             """
-            INSERT INTO quiz_attempts
-                (lesson_id, question_id, selected_answer, is_correct)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO user_quiz_attempts
+                (user_id, lesson_id, question_id, selected_answer, is_correct)
+            VALUES (?, ?, ?, ?, ?)
             """,
             (
+                session["user_id"],
                 question_row["lesson_id"],
                 question_row["id"],
                 selected_answer,
@@ -672,20 +979,22 @@ def submit_quiz(slug):
             FROM lesson_questions
             WHERE lesson_id = ?
               AND NOT EXISTS (
-                  SELECT 1 FROM quiz_attempts
-                  WHERE quiz_attempts.question_id = lesson_questions.id
-                    AND quiz_attempts.is_correct = 1
+                  SELECT 1 FROM user_quiz_attempts
+                  WHERE user_quiz_attempts.user_id = ?
+                    AND user_quiz_attempts.question_id = lesson_questions.id
+                    AND user_quiz_attempts.is_correct = 1
               )
             """,
-            (question_row["lesson_id"],),
+            (question_row["lesson_id"], session["user_id"]),
         ).fetchone()[0]
         if incomplete_count == 0:
             db.execute(
                 """
-                UPDATE progress SET completed = 1, completed_at = CURRENT_TIMESTAMP
-                WHERE lesson_id = ?
+                UPDATE user_progress
+                SET completed = 1, completed_at = CURRENT_TIMESTAMP
+                WHERE lesson_id = ? AND user_id = ?
                 """,
-                (question_row["lesson_id"],),
+                (question_row["lesson_id"], session["user_id"]),
             )
     return redirect(url_for("lesson_page", slug=slug))
 
