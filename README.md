@@ -60,19 +60,21 @@ $env:MATH_APP_DB = "C:\경로\learning.db"
 
 세션 서명 키는 최초 실행 시 DB 옆의 `.flask_secret` 파일에 생성되며 Git에서 제외됩니다. 이 파일은 비밀로 보관하고 지우거나 바꾸지 마세요. 잃어버리면 모든 사용자가 다시 로그인해야 합니다. VM에서는 앱을 실행하는 계정만 읽을 수 있도록 파일 권한을 보호하세요.
 
-> **중요: 현재 Azure 실습 주소는 HTTP입니다.** HTTP에서는 로그인 비밀번호와 세션 쿠키가 전송 중 암호화되지 않습니다. 이 주소에서 실제/재사용 비밀번호를 사용하지 말고, 다른 사용자를 받기 전에 HTTPS를 설정하세요. 인터넷 공개 운영 환경에서는 HTTPS, 계정 잠금/비밀번호 재설정, 백업과 운영용 WSGI 서버도 필요합니다.
+> **중요:** 기존 `http://20.196.64.236:8000` 주소는 HTTP라서 로그인 정보와 세션 쿠키가 암호화되지 않습니다. 학습자 계정은 실습용 비밀번호만 사용하세요. 관리자는 아래 HTTPS 주소에서만 로그인할 수 있습니다.
 
 ## 관리자와 학습 기록
 
 가입 화면에는 아이디, 로그인 시각, 답안과 진도가 운영자에게 보일 수 있다고 안내합니다. 앱은 가입·로그인·로그아웃 시각과 문제 답안/정오답을 기록합니다. IP 주소, 기기 정보, 비밀번호는 관리자 로그에 저장하지 않습니다.
 
-관리자 아이디는 `1`이며 일반 가입에 사용할 수 없습니다. 관리자 기능은 기본적으로 꺼져 있습니다. HTTPS가 적용된 SSH 전용 터널을 준비한 후 `ADMIN_ENABLED=1`과 VM의 `ADMIN_PASSWORD` 환경변수를 설정해야 활성화됩니다. 비밀번호는 실습용으로 1~100자까지 허용하므로 `1`을 쓸 수도 있지만, 관리자 비밀번호는 공개 HTTP 페이지에서 입력하지 마세요. 로그인 정보는 비밀번호 해시로 저장됩니다.
+관리자 아이디 `1`은 앱이 자동으로 만드는 계정이며 회원가입 화면에서 가입하지 않습니다. 일반 방문자는 배포 주소에서 각자 회원가입해 문제를 풉니다. 관리자 로그에는 가입·로그인·로그아웃 시각, 답안과 정오답, 진도가 기록됩니다. IP 주소, 기기 정보, 비밀번호는 기록하지 않습니다. 가입 화면에 기록 안내가 표시됩니다.
 
-도메인이 없는 이번 실습에서는 Nginx가 **VM 내부의 `127.0.0.1:8443`에서만** 자체 서명 HTTPS를 제공하고, VM의 SSH 포트 포워딩을 통해 본인 PC의 `https://localhost:8443`으로 연결합니다. Nginx 설정은 [deploy/nginx-math-admin.conf](./deploy/nginx-math-admin.conf)에 있습니다. 공용 IP의 8000 포트는 계속 일반 학습 페이지(HTTP)용이며, 이 경로에서 관리자 아이디 `1` 로그인을 시도하면 차단됩니다. 공개 HTTP 페이지에선 학습자 로그인 정보가 암호화되지 않으므로 실습용 계정만 사용하세요.
+관리자 기능은 기본적으로 꺼져 있습니다. 공개 주소에서 `1/1`처럼 누구나 추측할 수 있는 비밀번호를 쓰면 방문자 누구나 타인의 학습 기록을 볼 수 있으므로 사용하지 마세요. 아래 설정에서 관리자 아이디 `1`과 별도의 강한 비밀번호를 활성화하세요. 비밀번호는 1~100자이며 DB에는 해시로 저장됩니다. 이미 학습자가 아이디 `1`을 사용 중이면 앱은 그 계정을 관리자로 바꾸지 않고 시작을 거부합니다.
 
-### Azure VM에 관리자 터널 설정
+### 공개 주소에 HTTPS와 관리자 로그인 설정
 
-1. SSH로 VM에 접속합니다. 현재 앱 서버가 실행 중이면 해당 터미널에서 `Ctrl+C`로 중지하고 최신 코드를 받습니다.
+도메인이 없는 실습용으로 VM의 공용 IP에 자체 서명 인증서를 설치합니다. 관리자 URL은 `https://20.196.64.236/login`이며 브라우저의 인증서 경고가 나타날 수 있습니다. 이 인증서는 본인 VM에서 생성한 것입니다. Azure NSG에 **인바운드 TCP 443**을 허용해야 합니다. 기존 학습 주소 `http://20.196.64.236:8000`은 계속 방문자용으로 사용할 수 있지만 HTTP이므로 실습용 비밀번호만 사용하세요.
+
+1. VM SSH 터미널에서 기존 Flask 앱을 실행 중이라면 `Ctrl+C`로 중지하고 코드를 갱신합니다.
 
    ```bash
    cd ~/practice_test
@@ -81,50 +83,44 @@ $env:MATH_APP_DB = "C:\경로\learning.db"
    sudo apt install -y nginx openssl
    ```
 
-2. VM 안에서만 쓸 localhost 인증서를 만듭니다.
+2. VM 공용 IP를 포함한 자체 서명 인증서를 생성합니다.
 
    ```bash
    sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
-     -keyout /etc/ssl/private/math-admin.key \
-     -out /etc/ssl/certs/math-admin.crt \
-     -subj '/CN=localhost' \
-     -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1'
-   sudo chmod 600 /etc/ssl/private/math-admin.key
+     -keyout /etc/ssl/private/math-app.key \
+     -out /etc/ssl/certs/math-app.crt \
+     -subj '/CN=20.196.64.236' \
+     -addext 'subjectAltName=IP:20.196.64.236'
+   sudo chmod 600 /etc/ssl/private/math-app.key
    ```
 
-3. Nginx 설정을 설치하고 검사한 뒤 다시 불러옵니다.
+3. HTTPS 프록시 설정을 설치하고 적용합니다.
 
    ```bash
-   sudo cp deploy/nginx-math-admin.conf /etc/nginx/sites-available/math-admin
-   sudo ln -s /etc/nginx/sites-available/math-admin /etc/nginx/sites-enabled/math-admin
+   sudo cp deploy/nginx-math-https.conf /etc/nginx/sites-available/math-app
+   sudo ln -sfn /etc/nginx/sites-available/math-app /etc/nginx/sites-enabled/math-app
    sudo nginx -t
    sudo systemctl reload nginx
    ```
 
-   Nginx가 `127.0.0.1:8443`에만 바인딩하므로 Azure NSG에 8443 인바운드 포트를 열지 않습니다.
-
-4. 같은 SSH 터미널에서 관리자 기능과 실습 비밀번호를 설정하고 앱을 실행합니다.
+4. 앱 실행 터미널에서 관리자 계정을 켜고 강한 비밀번호를 설정합니다. 아래 `read` 명령은 비밀번호를 화면에 표시하지 않습니다. 입력한 값을 기억해 두세요.
 
    ```bash
    export ADMIN_ENABLED=1
-   export ADMIN_PASSWORD=1
+   read -s -p "관리자 비밀번호(1~100자, 추측하기 어려운 값): " ADMIN_PASSWORD
+   echo
+   export ADMIN_PASSWORD
    export SESSION_COOKIE_SECURE=1
    export TRUST_PROXY=1
    source .venv/bin/activate
    python app.py
    ```
 
-   `ADMIN_PASSWORD=1`은 SSH 터널 안에서만 쓰는 일회성 실습 비밀번호입니다. 이미 일반 계정이 아이디 `1`을 사용 중이면 앱은 그 계정을 관리자 계정으로 탈취하지 않고 시작을 거부합니다.
+5. Azure Portal의 VM 네트워크 보안 그룹(NSG)에 인바운드 **TCP 443** 허용 규칙을 추가합니다. SSH 포트는 열 필요가 없으며, 앱을 실행한 VM 터미널은 켜 둡니다.
 
-5. **내 Windows PC의 로컬 PowerShell/VS Code 터미널**에서 별도 터미널을 열고 SSH 포트 포워딩을 시작합니다. 개인 키 경로와 VM 사용자 이름을 실제 값으로 바꾸세요. 이 터미널은 접속하는 동안 계속 켜둡니다.
+6. 브라우저에서 `https://20.196.64.236/login`으로 접속해 관리자 아이디 `1`과 방금 설정한 비밀번호로 로그인합니다. 방문자는 기존 배포 주소에서 일반 아이디로 가입하고 문제를 풉니다.
 
-   ```powershell
-   ssh -i "C:\키파일\경로\이름.pem" -N -L 8443:127.0.0.1:8443 azureuser@20.196.64.236
-   ```
-
-6. 내 PC 브라우저에서 `https://localhost:8443/login`을 엽니다. 자체 서명 인증서 경고가 표시되면 localhost 인증서가 이 VM에서 만든 것인지 확인한 뒤에만 계속 진행하고, 아이디 `1`, 비밀번호 `1`로 로그인합니다. 로그인 후 **관리자** 메뉴에서 활동을 볼 수 있습니다.
-
-터널이나 앱을 종료하려면 각각의 실행 터미널에서 `Ctrl+C`를 누릅니다. 이 구성이 관리 화면 접근을 SSH 터널로 제한하지만, 공개 학습 사이트 자체는 여전히 HTTP입니다.
+자체 서명 인증서 경고는 도메인 없이 IP로 HTTPS를 제공할 때 발생합니다. 장기적으로는 도메인과 신뢰되는 인증서를 설정하는 것을 권장합니다. 관리자 HTTPS 접속도 Azure 인바운드 443 규칙으로 인터넷에 공개되므로, 강한 관리자 비밀번호를 사용하고 VM의 운영체제와 패키지를 최신 상태로 유지하세요.
 
 ## Azure VM에 변경 내용 반영하기
 
@@ -139,4 +135,4 @@ python app.py
 
 앱이 다시 시작될 때 새 문제 테이블, 144개 문제와 사용자별/활동 로그 테이블이 자동으로 추가됩니다. 기존 DB와 공용 기록은 유지되지만, 기록을 소유자별로 나눌 수 없어 새 계정으로 옮기지 않습니다. 이후 계정별 기록은 사용자별 테이블에 저장됩니다. 첫 실행 시 `.flask_secret`도 생성되므로 DB와 함께 보존하세요. 서버를 실행한 터미널을 열어 둔 상태에서 브라우저를 새로고침하세요.
 
-현재 프로젝트는 학습 진도와 퀴즈를 확인하기 위한 실습용 앱입니다. 공개 운영 시에는 위 HTTPS 설정과 운영용 웹 서버 구성이 필요합니다.
+앱을 재시작할 때마다 관리자 환경변수를 다시 설정해야 합니다. 기존 SQLite DB와 `.flask_secret`을 보존하면 사용자 계정과 진도는 유지됩니다.
