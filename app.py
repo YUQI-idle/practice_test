@@ -6,6 +6,8 @@ from pathlib import Path
 
 from flask import Flask, abort, redirect, render_template_string, request, url_for
 
+from question_bank import QUESTION_BANK
+
 app = Flask(__name__)
 app.config["DATABASE"] = os.environ.get(
     "MATH_APP_DB", str(Path(__file__).with_name("learning.db"))
@@ -258,8 +260,10 @@ BASE_STYLE = """
   .done { background: #dcfce7; color: #166534; }
   .locked { opacity: .7; }
   .lesson-content { white-space: pre-line; }
+  .question-card { margin: 16px 0; padding: 18px; border: 1px solid #dce4ef; border-radius: 10px; }
   .choices { display: grid; gap: 10px; margin: 16px 0; }
   label.choice { display: flex; gap: 10px; padding: 10px 12px; border: 1px solid #dce4ef; border-radius: 8px; }
+  .difficulty { margin-top: 24px; padding-bottom: 6px; border-bottom: 1px solid #dce4ef; }
   button { border: 0; border-radius: 8px; padding: 10px 18px; background: #0369a1; color: white; font: inherit; cursor: pointer; }
   button:hover { background: #075985; }
   .notice { margin: 14px 0; padding: 12px 16px; border-radius: 8px; background: #ecfeff; }
@@ -284,8 +288,6 @@ HOME_PAGE = """
     <div class="progress-bar" style="width: {{ progress_percent }}%"></div>
   </div>
   <p class="meta">{{ completed_count }} / {{ total_count }} 단계 완료 ({{ progress_percent }}%)</p>
-  {% if result == 'correct' %}<p class="notice">정답이에요! 진도를 저장했습니다. 다음 단계로 이어가 보세요.</p>{% endif %}
-  {% if result == 'incorrect' %}<p class="notice error">아직 정답이 아니에요. 해설을 확인하고 다시 도전해 보세요.</p>{% endif %}
 </section>
 {% for module, lessons in modules %}
 <h2>{{ module }}</h2>
@@ -323,25 +325,45 @@ LESSON_PAGE = """
   {% endfor %}
 </main>
 <section class="panel">
-  <h2>확인 문제</h2>
-  <p>{{ lesson['question'] }}</p>
-  <form method="post" action="{{ url_for('submit_quiz', slug=lesson['slug']) }}">
-    <div class="choices">
-    {% for choice in lesson['choices'] %}
-      <label class="choice"><input type="radio" name="answer" value="{{ loop.index0 }}" required> {{ choice }}</label>
+  <h2>확인 문제 · {{ questions|length }}문제</h2>
+  <p class="muted">난이도별로 세 문제씩 풀어보세요. 답을 선택하고 <strong>답 확인</strong>을 누르면 정답과 해설을 볼 수 있습니다.</p>
+  {% for difficulty in difficulties %}
+    <h3 class="difficulty">{{ difficulty }} <span class="meta">({{ question_groups[difficulty]|length }}문제)</span></h3>
+    {% for question in question_groups[difficulty] %}
+    <article class="question-card">
+      <h4>{{ loop.index }}. {{ question['prompt'] }}</h4>
+      <form method="post" action="{{ url_for('submit_quiz', slug=lesson['slug']) }}">
+        <input type="hidden" name="question_id" value="{{ question['id'] }}">
+        <div class="choices">
+        {% for choice in question['choices'] %}
+          <label class="choice">
+            <input type="radio" name="answer" value="{{ loop.index0 }}" required
+              {% if question['latest_attempt'] and question['latest_attempt']['selected_answer'] == loop.index0 %}checked{% endif %}>
+            {{ choice }}
+          </label>
+        {% endfor %}
+        </div>
+        <button type="submit">답 확인</button>
+      </form>
+      {% if question['latest_attempt'] %}
+      <p class="notice {% if not question['latest_attempt']['is_correct'] %}error{% endif %}">
+        {% if question['latest_attempt']['is_correct'] %}정답입니다!{% else %}다시 생각해 보세요.{% endif %}
+        정답: <strong>{{ question['choices'][question['answer']] }}</strong><br>
+        {{ question['explanation'] }}
+      </p>
+      {% endif %}
+    </article>
     {% endfor %}
-    </div>
-    <button type="submit">답안 제출</button>
-  </form>
+  {% endfor %}
   {% if lesson['completed'] %}
-  <p class="notice">이 단계는 완료했어요. 다시 풀어도 진도 기록은 유지됩니다.</p>
+  <p class="notice">이 단계의 모든 문제가 완료됐어요. 다시 풀어도 진도 기록은 유지됩니다.</p>
   {% endif %}
 </section>
 <section class="panel" style="margin-top:16px">
   <h2>이전 학습 기록</h2>
   {% if attempts %}
   <ul>{% for attempt in attempts %}
-    <li>{{ attempt['created_at'] }} · {{ '정답' if attempt['is_correct'] else '오답' }}</li>
+    <li>{{ attempt['created_at'] }} · {{ attempt['difficulty'] }} {{ attempt['question_position'] }}번 · {{ '정답' if attempt['is_correct'] else '오답' }}</li>
   {% endfor %}</ul>
   {% else %}<p class="muted">아직 제출한 답안이 없습니다.</p>{% endif %}
 </section>
@@ -404,8 +426,26 @@ def init_db():
                 is_correct INTEGER NOT NULL CHECK (is_correct IN (0, 1)),
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE IF NOT EXISTS lesson_questions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                lesson_id INTEGER NOT NULL REFERENCES lessons(id),
+                difficulty TEXT NOT NULL CHECK (difficulty IN ('쉬움', '중간', '어려움')),
+                position INTEGER NOT NULL,
+                prompt TEXT NOT NULL,
+                choices_json TEXT NOT NULL,
+                answer INTEGER NOT NULL,
+                explanation TEXT NOT NULL,
+                UNIQUE (lesson_id, difficulty, position)
+            );
             """
         )
+        attempt_columns = {
+            row["name"] for row in db.execute("PRAGMA table_info(quiz_attempts)")
+        }
+        if "question_id" not in attempt_columns:
+            db.execute(
+                "ALTER TABLE quiz_attempts ADD COLUMN question_id INTEGER REFERENCES lesson_questions(id)"
+            )
         db.execute(
             """
             INSERT OR IGNORE INTO learner_profile (id, level, goal, study_time, data_scope)
@@ -439,6 +479,28 @@ def init_db():
                     position,
                 ),
             )
+            lesson_id = db.execute(
+                "SELECT id FROM lessons WHERE slug = ?", (lesson["slug"],)
+            ).fetchone()["id"]
+            for difficulty, questions in QUESTION_BANK[lesson["slug"]].items():
+                for question_position, item in enumerate(questions, start=1):
+                    db.execute(
+                        """
+                        INSERT OR IGNORE INTO lesson_questions
+                            (lesson_id, difficulty, position, prompt, choices_json,
+                             answer, explanation)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            lesson_id,
+                            difficulty,
+                            question_position,
+                            item["prompt"],
+                            json.dumps(item["choices"], ensure_ascii=False),
+                            item["answer"],
+                            item["explanation"],
+                        ),
+                    )
         db.execute(
             """
             INSERT OR IGNORE INTO progress (lesson_id)
@@ -450,7 +512,6 @@ def init_db():
 def load_lesson(row):
     lesson = dict(row)
     lesson["content"] = json.loads(lesson.pop("content_json"))
-    lesson["choices"] = json.loads(lesson.pop("choices_json"))
     lesson["completed"] = bool(lesson.pop("completed"))
     return lesson
 
@@ -507,48 +568,126 @@ def lesson_page(slug):
         lesson = load_lesson(row)
         attempts = db.execute(
             """
-            SELECT is_correct, created_at FROM quiz_attempts
-            WHERE lesson_id = (SELECT id FROM lessons WHERE slug = ?)
-            ORDER BY id DESC LIMIT 10
+            SELECT quiz_attempts.is_correct, quiz_attempts.created_at,
+                   lesson_questions.difficulty, lesson_questions.position
+            FROM quiz_attempts
+            JOIN lesson_questions ON lesson_questions.id = quiz_attempts.question_id
+            WHERE quiz_attempts.lesson_id = (SELECT id FROM lessons WHERE slug = ?)
+            ORDER BY quiz_attempts.id DESC LIMIT 10
             """,
             (slug,),
         ).fetchall()
-    return render_template_string(LESSON_PAGE, lesson=lesson, attempts=attempts)
+        question_rows = db.execute(
+            """
+            SELECT lesson_questions.*,
+                   latest.selected_answer AS latest_selected_answer,
+                   latest.is_correct AS latest_is_correct
+            FROM lesson_questions
+            LEFT JOIN (
+                SELECT question_id, selected_answer, is_correct
+                FROM quiz_attempts
+                WHERE id IN (
+                    SELECT MAX(id) FROM quiz_attempts
+                    WHERE question_id IS NOT NULL GROUP BY question_id
+                )
+            ) AS latest ON latest.question_id = lesson_questions.id
+            WHERE lesson_questions.lesson_id = (
+                SELECT id FROM lessons WHERE slug = ?
+            )
+            ORDER BY
+                CASE lesson_questions.difficulty
+                    WHEN '쉬움' THEN 1 WHEN '중간' THEN 2 ELSE 3
+                END,
+                lesson_questions.position
+            """,
+            (slug,),
+        ).fetchall()
+
+    difficulties = ("쉬움", "중간", "어려움")
+    question_groups = {difficulty: [] for difficulty in difficulties}
+    for row in question_rows:
+        question = dict(row)
+        question["choices"] = json.loads(question.pop("choices_json"))
+        question["latest_attempt"] = None
+        if question["latest_is_correct"] is not None:
+            question["latest_attempt"] = {
+                "selected_answer": question["latest_selected_answer"],
+                "is_correct": bool(question["latest_is_correct"]),
+            }
+        question.pop("latest_selected_answer")
+        question.pop("latest_is_correct")
+        question_groups[question["difficulty"]].append(question)
+
+    return render_template_string(
+        LESSON_PAGE,
+        lesson=lesson,
+        attempts=attempts,
+        difficulties=difficulties,
+        question_groups=question_groups,
+        questions=question_rows,
+    )
 
 
 @app.route("/lessons/<slug>/quiz", methods=["POST"])
 def submit_quiz(slug):
     answer_value = request.form.get("answer", "")
-    with get_db() as db:
-        lesson = db.execute(
-            "SELECT id, answer, choices_json FROM lessons WHERE slug = ?", (slug,)
+    question_value = request.form.get("question_id", "")
+    with database() as db:
+        question_row = db.execute(
+            """
+            SELECT lesson_questions.id, lesson_questions.lesson_id,
+                   lesson_questions.answer, lesson_questions.choices_json
+            FROM lesson_questions
+            JOIN lessons ON lessons.id = lesson_questions.lesson_id
+            WHERE lessons.slug = ? AND lesson_questions.id = ?
+            """,
+            (slug, question_value),
         ).fetchone()
-        if lesson is None:
+        if question_row is None:
             abort(404)
         try:
             selected_answer = int(answer_value)
         except ValueError:
             abort(400, description="답안을 선택해 주세요.")
-        if not 0 <= selected_answer < len(json.loads(lesson["choices_json"])):
+        if not 0 <= selected_answer < len(json.loads(question_row["choices_json"])):
             abort(400, description="유효하지 않은 답안입니다.")
 
-        is_correct = selected_answer == lesson["answer"]
+        is_correct = selected_answer == question_row["answer"]
         db.execute(
             """
-            INSERT INTO quiz_attempts (lesson_id, selected_answer, is_correct)
-            VALUES (?, ?, ?)
+            INSERT INTO quiz_attempts
+                (lesson_id, question_id, selected_answer, is_correct)
+            VALUES (?, ?, ?, ?)
             """,
-            (lesson["id"], selected_answer, int(is_correct)),
+            (
+                question_row["lesson_id"],
+                question_row["id"],
+                selected_answer,
+                int(is_correct),
+            ),
         )
-        if is_correct:
+        incomplete_count = db.execute(
+            """
+            SELECT COUNT(*)
+            FROM lesson_questions
+            WHERE lesson_id = ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM quiz_attempts
+                  WHERE quiz_attempts.question_id = lesson_questions.id
+                    AND quiz_attempts.is_correct = 1
+              )
+            """,
+            (question_row["lesson_id"],),
+        ).fetchone()[0]
+        if incomplete_count == 0:
             db.execute(
                 """
                 UPDATE progress SET completed = 1, completed_at = CURRENT_TIMESTAMP
                 WHERE lesson_id = ?
                 """,
-                (lesson["id"],),
+                (question_row["lesson_id"],),
             )
-    return redirect(url_for("home", result="correct" if is_correct else "incorrect"))
+    return redirect(url_for("lesson_page", slug=slug))
 
 
 if __name__ == "__main__":
