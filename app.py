@@ -18,7 +18,7 @@ from flask import (
     session,
     url_for,
 )
-from werkzeug.middleware.proxy_fix import ProxyFix
+from flask.sessions import SecureCookieSessionInterface
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from question_bank import QUESTION_BANK
@@ -58,8 +58,29 @@ if app.config["ADMIN_ENABLED"] and not 1 <= len(app.config["ADMIN_PASSWORD"]) <=
     raise RuntimeError("ADMIN_PASSWORD must be between 1 and 100 characters.")
 if app.config["ADMIN_ENABLED"] and not app.config["SESSION_COOKIE_SECURE"]:
     raise RuntimeError("Set SESSION_COOKIE_SECURE=1 before enabling the admin account.")
-if os.environ.get("TRUST_PROXY") == "1":
-    app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1)
+
+
+class LocalHttpsProxy:
+    def __init__(self, application):
+        self.application = application
+
+    def __call__(self, environ, start_response):
+        if (
+            os.environ.get("TRUST_PROXY") == "1"
+            and environ.get("REMOTE_ADDR") == "127.0.0.1"
+            and environ.get("HTTP_X_FORWARDED_PROTO") == "https"
+        ):
+            environ["wsgi.url_scheme"] = "https"
+        return self.application(environ, start_response)
+
+
+class RequestAwareSessionInterface(SecureCookieSessionInterface):
+    def get_cookie_secure(self, app):
+        return request.is_secure
+
+
+app.session_interface = RequestAwareSessionInterface()
+app.wsgi_app = LocalHttpsProxy(app.wsgi_app)
 
 COURSE = [
     {
@@ -814,8 +835,8 @@ def record_activity(db, user_id, event_type):
 def require_admin():
     if not app.config["ADMIN_ENABLED"]:
         abort(404)
-    if not request.is_secure:
-        abort(403, description="관리자 기능은 HTTPS 연결에서만 사용할 수 있습니다.")
+    if not request.is_secure or request.remote_addr != "127.0.0.1":
+        abort(403, description="관리자 기능은 SSH 터널의 HTTPS 연결에서만 사용할 수 있습니다.")
     if not session.get("user_id"):
         abort(403)
     with database() as db:
@@ -865,7 +886,10 @@ def inject_template_context():
                 "SELECT role FROM users WHERE id = ?", (session["user_id"],)
             ).fetchone()
             is_admin = (
-                row is not None and row["role"] == "admin" and request.is_secure
+                row is not None
+                and row["role"] == "admin"
+                and request.is_secure
+                and request.remote_addr == "127.0.0.1"
             )
     return {
         "csrf_token": session["_csrf_token"],
@@ -973,6 +997,10 @@ def login():
             error="아이디와 비밀번호는 각각 1~100자로 입력해 주세요.",
             next_url=next_url,
         ), 400
+    if username == app.config["ADMIN_USERNAME"] and (
+        not request.is_secure or request.remote_addr != "127.0.0.1"
+    ):
+        abort(403, description="관리자 로그인은 SSH 터널의 HTTPS 주소에서만 가능합니다.")
     with database() as db:
         user = db.execute(
             "SELECT id, username, password_hash, role FROM users WHERE username = ?",
@@ -985,8 +1013,10 @@ def login():
             error="아이디 또는 비밀번호를 확인해 주세요.",
             next_url=next_url,
         ), 401
-    if user["role"] == "admin" and not request.is_secure:
-        abort(403, description="관리자 로그인을 위해 HTTPS 연결이 필요합니다.")
+    if user["role"] == "admin" and (
+        not request.is_secure or request.remote_addr != "127.0.0.1"
+    ):
+        abort(403, description="관리자 로그인은 SSH 터널의 HTTPS 주소에서만 가능합니다.")
 
     with database() as db:
         record_activity(db, user["id"], "login")

@@ -66,22 +66,65 @@ $env:MATH_APP_DB = "C:\경로\learning.db"
 
 가입 화면에는 아이디, 로그인 시각, 답안과 진도가 운영자에게 보일 수 있다고 안내합니다. 앱은 가입·로그인·로그아웃 시각과 문제 답안/정오답을 기록합니다. IP 주소, 기기 정보, 비밀번호는 관리자 로그에 저장하지 않습니다.
 
-관리자 아이디는 `1`이며 일반 가입에 사용할 수 없습니다. 관리자 기능은 기본적으로 꺼져 있습니다. `ADMIN_ENABLED=1`과 `ADMIN_PASSWORD`를 설정하고 앱을 HTTPS로 서비스할 때만 관리자 계정이 활성화되며, 비밀번호는 실습용으로 1~100자까지 허용합니다. 짧은 비밀번호는 실습용으로만 사용하고, 공개 운영 서비스에는 사용하지 마세요. 비밀번호는 코드/GitHub가 아닌 VM의 환경변수로 관리하세요.
+관리자 아이디는 `1`이며 일반 가입에 사용할 수 없습니다. 관리자 기능은 기본적으로 꺼져 있습니다. HTTPS가 적용된 SSH 전용 터널을 준비한 후 `ADMIN_ENABLED=1`과 VM의 `ADMIN_PASSWORD` 환경변수를 설정해야 활성화됩니다. 비밀번호는 실습용으로 1~100자까지 허용하므로 `1`을 쓸 수도 있지만, 관리자 비밀번호는 공개 HTTP 페이지에서 입력하지 마세요. 로그인 정보는 비밀번호 해시로 저장됩니다.
 
-HTTPS를 종료하는 신뢰할 수 있는 리버스 프록시가 `X-Forwarded-Proto: https`를 전달하도록 설정된 경우에만 앱 실행 환경에 다음을 설정합니다. HTTPS 프록시가 없으면 관리자 기능을 켜지 마세요.
+도메인이 없는 이번 실습에서는 Nginx가 **VM 내부의 `127.0.0.1:8443`에서만** 자체 서명 HTTPS를 제공하고, VM의 SSH 포트 포워딩을 통해 본인 PC의 `https://localhost:8443`으로 연결합니다. Nginx 설정은 [deploy/nginx-math-admin.conf](./deploy/nginx-math-admin.conf)에 있습니다. 공용 IP의 8000 포트는 계속 일반 학습 페이지(HTTP)용이며, 이 경로에서 관리자 아이디 `1` 로그인을 시도하면 차단됩니다. 공개 HTTP 페이지에선 학습자 로그인 정보가 암호화되지 않으므로 실습용 계정만 사용하세요.
 
-```bash
-export ADMIN_ENABLED=1
-read -s -p "관리자 비밀번호(1~100자): " ADMIN_PASSWORD
-echo
-export ADMIN_PASSWORD
-export SESSION_COOKIE_SECURE=1
-export TRUST_PROXY=1
-```
+### Azure VM에 관리자 터널 설정
 
-그 설정을 유지한 셸에서 앱을 실행하면 아이디 `1`로 관리자 로그인 후 상단 **관리자** 링크에서 계정별 가입·최근 로그인/활동, 챕터 진도, 제출한 선택지와 정답 여부를 볼 수 있습니다. 로그는 계정의 아이디와 연결됩니다. 관리자 비밀번호는 해시로 저장됩니다. 이미 학습자가 아이디 `1`을 사용하고 있으면 계정 탈취를 막기 위해 관리자 활성화가 시작 단계에서 중단되므로, 해당 계정을 안전하게 다른 아이디로 변경하기 전까지 기능을 켜지 마세요.
+1. SSH로 VM에 접속합니다. 현재 앱 서버가 실행 중이면 해당 터미널에서 `Ctrl+C`로 중지하고 최신 코드를 받습니다.
 
-리버스 프록시 없이 일반 HTTP에서 로그인/학습을 하는 것은 실습에만 사용하세요. 관리자 로그인은 HTTPS가 아니면 거부됩니다.
+   ```bash
+   cd ~/practice_test
+   git pull origin main
+   sudo apt update
+   sudo apt install -y nginx openssl
+   ```
+
+2. VM 안에서만 쓸 localhost 인증서를 만듭니다.
+
+   ```bash
+   sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+     -keyout /etc/ssl/private/math-admin.key \
+     -out /etc/ssl/certs/math-admin.crt \
+     -subj '/CN=localhost' \
+     -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1'
+   sudo chmod 600 /etc/ssl/private/math-admin.key
+   ```
+
+3. Nginx 설정을 설치하고 검사한 뒤 다시 불러옵니다.
+
+   ```bash
+   sudo cp deploy/nginx-math-admin.conf /etc/nginx/sites-available/math-admin
+   sudo ln -s /etc/nginx/sites-available/math-admin /etc/nginx/sites-enabled/math-admin
+   sudo nginx -t
+   sudo systemctl reload nginx
+   ```
+
+   Nginx가 `127.0.0.1:8443`에만 바인딩하므로 Azure NSG에 8443 인바운드 포트를 열지 않습니다.
+
+4. 같은 SSH 터미널에서 관리자 기능과 실습 비밀번호를 설정하고 앱을 실행합니다.
+
+   ```bash
+   export ADMIN_ENABLED=1
+   export ADMIN_PASSWORD=1
+   export SESSION_COOKIE_SECURE=1
+   export TRUST_PROXY=1
+   source .venv/bin/activate
+   python app.py
+   ```
+
+   `ADMIN_PASSWORD=1`은 SSH 터널 안에서만 쓰는 일회성 실습 비밀번호입니다. 이미 일반 계정이 아이디 `1`을 사용 중이면 앱은 그 계정을 관리자 계정으로 탈취하지 않고 시작을 거부합니다.
+
+5. **내 Windows PC의 로컬 PowerShell/VS Code 터미널**에서 별도 터미널을 열고 SSH 포트 포워딩을 시작합니다. 개인 키 경로와 VM 사용자 이름을 실제 값으로 바꾸세요. 이 터미널은 접속하는 동안 계속 켜둡니다.
+
+   ```powershell
+   ssh -i "C:\키파일\경로\이름.pem" -N -L 8443:127.0.0.1:8443 azureuser@20.196.64.236
+   ```
+
+6. 내 PC 브라우저에서 `https://localhost:8443/login`을 엽니다. 자체 서명 인증서 경고가 표시되면 localhost 인증서가 이 VM에서 만든 것인지 확인한 뒤에만 계속 진행하고, 아이디 `1`, 비밀번호 `1`로 로그인합니다. 로그인 후 **관리자** 메뉴에서 활동을 볼 수 있습니다.
+
+터널이나 앱을 종료하려면 각각의 실행 터미널에서 `Ctrl+C`를 누릅니다. 이 구성이 관리 화면 접근을 SSH 터널로 제한하지만, 공개 학습 사이트 자체는 여전히 HTTP입니다.
 
 ## Azure VM에 변경 내용 반영하기
 
