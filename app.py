@@ -1,7 +1,6 @@
 import hmac
 import json
 import os
-import re
 import secrets
 import sqlite3
 from contextlib import contextmanager
@@ -442,13 +441,14 @@ AUTH_PAGE = """
   {% if error %}<p class="notice error">{{ error }}</p>{% endif %}
   <form method="post">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <p><label>아이디 (영문, 숫자, 밑줄 / 3~32자)<br>
-      <input name="username" minlength="3" maxlength="32" pattern="[A-Za-z0-9_]{3,32}" required autocomplete="username">
+    <p><label>아이디 (1~100자)<br>
+      <input type="text" name="username" minlength="1" maxlength="100" required autocomplete="username">
     </label></p>
-    <p><label>비밀번호 (12자 이상)<br>
-      <input type="password" name="password" minlength="12" maxlength="256" required
+    <p><label>비밀번호 (1~100자)<br>
+      <input type="password" name="password" minlength="1" maxlength="100" required
         autocomplete="{{ 'new-password' if mode == 'register' else 'current-password' }}">
     </label></p>
+    <p class="meta">이메일이나 전화번호 인증 없이 바로 가입할 수 있습니다.</p>
     {% if mode == 'login' %}<input type="hidden" name="next" value="{{ next_url }}">{% endif %}
     <button type="submit">{{ '가입하고 시작하기' if mode == 'register' else '로그인' }}</button>
   </form>
@@ -726,18 +726,18 @@ def register():
 
     username = request.form.get("username", "").strip().lower()
     password = request.form.get("password", "")
-    if not re.fullmatch(r"[a-z0-9_]{3,32}", username):
+    if not 1 <= len(username) <= 100:
         return render_template_string(
             AUTH_PAGE,
             mode="register",
-            error="아이디는 영문 소문자, 숫자, 밑줄로 3~32자여야 합니다.",
+            error="아이디는 공백을 제외하고 1~100자로 입력해 주세요.",
             next_url="",
         ), 400
-    if not 12 <= len(password) <= 256:
+    if not 1 <= len(password) <= 100:
         return render_template_string(
             AUTH_PAGE,
             mode="register",
-            error="비밀번호는 12~256자로 입력해 주세요.",
+            error="비밀번호는 1~100자로 입력해 주세요.",
             next_url="",
         ), 400
 
@@ -779,6 +779,13 @@ def login():
 
     username = request.form.get("username", "").strip().lower()
     password = request.form.get("password", "")
+    if not 1 <= len(username) <= 100 or not 1 <= len(password) <= 100:
+        return render_template_string(
+            AUTH_PAGE,
+            mode="login",
+            error="아이디와 비밀번호는 각각 1~100자로 입력해 주세요.",
+            next_url=next_url,
+        ), 400
     with database() as db:
         user = db.execute(
             "SELECT id, username, password_hash FROM users WHERE username = ?",
