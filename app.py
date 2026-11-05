@@ -18,6 +18,7 @@ from flask import (
     session,
     url_for,
 )
+from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from question_bank import QUESTION_BANK
@@ -48,6 +49,17 @@ app.config.update(
     SESSION_COOKIE_SAMESITE="Lax",
     SESSION_COOKIE_SECURE=os.environ.get("SESSION_COOKIE_SECURE") == "1",
 )
+app.config["ADMIN_USERNAME"] = "1"
+app.config["ADMIN_PASSWORD"] = os.environ.get("ADMIN_PASSWORD", "")
+app.config["ADMIN_ENABLED"] = (
+    os.environ.get("ADMIN_ENABLED") == "1" and bool(app.config["ADMIN_PASSWORD"])
+)
+if app.config["ADMIN_ENABLED"] and not 1 <= len(app.config["ADMIN_PASSWORD"]) <= 100:
+    raise RuntimeError("ADMIN_PASSWORD must be between 1 and 100 characters.")
+if app.config["ADMIN_ENABLED"] and not app.config["SESSION_COOKIE_SECURE"]:
+    raise RuntimeError("Set SESSION_COOKIE_SECURE=1 before enabling the admin account.")
+if os.environ.get("TRUST_PROXY") == "1":
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1)
 
 COURSE = [
     {
@@ -300,6 +312,8 @@ BASE_STYLE = """
   .choices { display: grid; gap: 10px; margin: 16px 0; }
   label.choice { display: flex; gap: 10px; padding: 10px 12px; border: 1px solid #dce4ef; border-radius: 8px; }
   .difficulty { margin-top: 24px; padding-bottom: 6px; border-bottom: 1px solid #dce4ef; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { padding: 10px; text-align: left; vertical-align: top; border-bottom: 1px solid #dce4ef; }
   button { border: 0; border-radius: 8px; padding: 10px 18px; background: #0369a1; color: white; font: inherit; cursor: pointer; }
   button:hover { background: #075985; }
   .notice { margin: 14px 0; padding: 12px 16px; border-radius: 8px; background: #ecfeff; }
@@ -316,6 +330,9 @@ HOME_PAGE = """
 <title>수학 스텝업</title>""" + BASE_STYLE + """</head><body>
 <header><a href="{{ url_for('home') }}">수학 스텝업</a>
   <span class="meta"> · {{ session_username }}</span>
+  {% if is_admin %}
+  <a href="{{ url_for('admin_dashboard') }}">관리자</a>
+  {% endif %}
   <form method="post" action="{{ url_for('logout') }}" style="display:inline">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <button type="submit">로그아웃</button>
@@ -362,6 +379,9 @@ LESSON_PAGE = """
 <title>{{ lesson['title'] }} - 수학 스텝업</title>""" + BASE_STYLE + """</head><body>
 <header><a href="{{ url_for('home') }}">← 전체 학습 단계</a>
   <span class="meta"> · {{ session_username }}</span>
+  {% if is_admin %}
+  <a href="{{ url_for('admin_dashboard') }}">관리자</a>
+  {% endif %}
   <form method="post" action="{{ url_for('logout') }}" style="display:inline">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <button type="submit">로그아웃</button>
@@ -441,14 +461,17 @@ AUTH_PAGE = """
   {% if error %}<p class="notice error">{{ error }}</p>{% endif %}
   <form method="post">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <p><label>아이디 (1~100자)<br>
+    <p><label>아이디 (1~100자, 다른 계정과 중복 불가)<br>
       <input type="text" name="username" minlength="1" maxlength="100" required autocomplete="username">
     </label></p>
     <p><label>비밀번호 (1~100자)<br>
       <input type="password" name="password" minlength="1" maxlength="100" required
         autocomplete="{{ 'new-password' if mode == 'register' else 'current-password' }}">
     </label></p>
+    {% if mode == 'register' %}
+    <p class="notice">기록 안내: 아이디, 로그인 시각, 문제 답안과 진도는 운영자에게 보일 수 있습니다. IP 주소, 기기 정보, 비밀번호는 기록하지 않습니다.</p>
     <p class="meta">이메일이나 전화번호 인증 없이 바로 가입할 수 있습니다.</p>
+    {% endif %}
     {% if mode == 'login' %}<input type="hidden" name="next" value="{{ next_url }}">{% endif %}
     <button type="submit">{{ '가입하고 시작하기' if mode == 'register' else '로그인' }}</button>
   </form>
@@ -458,6 +481,54 @@ AUTH_PAGE = """
     <p>계정이 없나요? <a href="{{ url_for('register') }}">회원가입</a></p>
   {% endif %}
 </main>
+</body></html>
+"""
+
+ADMIN_PAGE = """
+<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>관리자 - 수학 스텝업</title>""" + BASE_STYLE + """</head><body>
+<header><a href="{{ url_for('home') }}">← 내 학습으로</a> · 관리자
+  <form method="post" action="{{ url_for('logout') }}" style="display:inline">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button type="submit">로그아웃</button>
+  </form>
+</header>
+<main class="hero">
+  <h1>학습 활동 관리자</h1>
+  <p>계정별 학습 현황과 최근 로그인·문제 풀이 기록입니다. IP 주소, 기기 정보, 비밀번호는 수집하지 않습니다.</p>
+  <p class="meta">계정 {{ users|length }}개 · 최근 활동 {{ events|length }}건 표시</p>
+</main>
+<section class="panel">
+  <h2>계정별 진도</h2>
+  {% if users %}
+  <div style="overflow-x:auto"><table>
+    <thead><tr><th>아이디</th><th>가입</th><th>최근 활동</th><th>완료 챕터</th><th>문제 제출</th></tr></thead>
+    <tbody>{% for user in users %}
+      <tr><td>{{ user['username'] }}</td><td>{{ user['created_at'] }}</td>
+      <td>{{ user['last_activity'] or '기록 없음' }}</td>
+      <td>{{ user['completed_lessons'] }} / {{ user['total_lessons'] }}</td>
+      <td>{{ user['attempt_count'] }}</td></tr>
+    {% endfor %}</tbody>
+  </table></div>
+  {% else %}<p>등록된 계정이 없습니다.</p>{% endif %}
+</section>
+<section class="panel" style="margin-top:16px">
+  <h2>최근 활동 및 답안</h2>
+  {% if events %}
+  <div style="overflow-x:auto"><table>
+    <thead><tr><th>시각</th><th>아이디</th><th>활동</th><th>문제 / 답안</th><th>결과</th></tr></thead>
+    <tbody>{% for event in events %}
+      <tr><td>{{ event['created_at'] }}</td><td>{{ event['username'] }}</td>
+      <td>{{ event['label'] }}</td>
+      <td>{% if event['lesson_title'] %}{{ event['lesson_title'] }} · {{ event['difficulty'] }} {{ event['question_position'] }}번
+        {% if event['selected_choice'] %}<br>선택: {{ event['selected_choice'] }}{% endif %}
+        {% else %}—{% endif %}</td>
+      <td>{% if event['is_correct'] is not none %}{{ '정답' if event['is_correct'] else '오답' }}{% else %}—{% endif %}</td></tr>
+    {% endfor %}</tbody>
+  </table></div>
+  {% else %}<p>아직 기록된 활동이 없습니다.</p>{% endif %}
+</section>
 </body></html>
 """
 
@@ -532,6 +603,8 @@ def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 username TEXT NOT NULL COLLATE NOCASE UNIQUE,
                 password_hash TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'learner'
+                    CHECK (role IN ('learner', 'admin')),
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE IF NOT EXISTS user_profiles (
@@ -559,8 +632,24 @@ def init_db():
             );
             CREATE INDEX IF NOT EXISTS idx_user_quiz_attempts_question
                 ON user_quiz_attempts (user_id, question_id, id);
+            CREATE TABLE IF NOT EXISTS user_activity (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                event_type TEXT NOT NULL
+                    CHECK (event_type IN ('register', 'login', 'logout')),
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_user_activity_user_created
+                ON user_activity (user_id, created_at);
             """
         )
+        user_columns = {
+            row["name"] for row in db.execute("PRAGMA table_info(users)")
+        }
+        if "role" not in user_columns:
+            db.execute(
+                "ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'learner'"
+            )
         attempt_columns = {
             row["name"] for row in db.execute("PRAGMA table_info(quiz_attempts)")
         }
@@ -629,6 +718,56 @@ def init_db():
             SELECT id FROM lessons
             """
         )
+        if app.config["ADMIN_ENABLED"]:
+            admin = db.execute(
+                "SELECT id, password_hash, role FROM users WHERE username = ?",
+                (app.config["ADMIN_USERNAME"],),
+            ).fetchone()
+            if admin and admin["role"] != "admin":
+                raise RuntimeError(
+                    "Username '1' is already used by a learner; rename that account before enabling the admin account."
+                )
+            admin_password_hash = (
+                admin["password_hash"]
+                if admin
+                and check_password_hash(
+                    admin["password_hash"], app.config["ADMIN_PASSWORD"]
+                )
+                else generate_password_hash(app.config["ADMIN_PASSWORD"])
+            )
+            if admin:
+                db.execute(
+                    "UPDATE users SET role = 'admin', password_hash = ? WHERE id = ?",
+                    (admin_password_hash, admin["id"]),
+                )
+                admin_id = admin["id"]
+            else:
+                cursor = db.execute(
+                    "INSERT INTO users (username, password_hash, role) VALUES (?, ?, 'admin')",
+                    (app.config["ADMIN_USERNAME"], admin_password_hash),
+                )
+                admin_id = cursor.lastrowid
+            db.execute(
+                """
+                INSERT OR IGNORE INTO user_profiles
+                    (user_id, level, goal, study_time, data_scope)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    admin_id,
+                    "고등수학 기초부터",
+                    "공학수학 독학, AI/머신러닝 수학 기초",
+                    "1시간",
+                    "학습 프로필, 단원 진도, 퀴즈 점수",
+                ),
+            )
+            db.execute(
+                """
+                INSERT OR IGNORE INTO user_progress (user_id, lesson_id)
+                SELECT ?, id FROM lessons
+                """,
+                (admin_id,),
+            )
 
 
 def initialize_user_data(db, user_id):
@@ -665,6 +804,28 @@ def load_lesson(row):
 init_db()
 
 
+def record_activity(db, user_id, event_type):
+    db.execute(
+        "INSERT INTO user_activity (user_id, event_type) VALUES (?, ?)",
+        (user_id, event_type),
+    )
+
+
+def require_admin():
+    if not app.config["ADMIN_ENABLED"]:
+        abort(404)
+    if not request.is_secure:
+        abort(403, description="관리자 기능은 HTTPS 연결에서만 사용할 수 있습니다.")
+    if not session.get("user_id"):
+        abort(403)
+    with database() as db:
+        user = db.execute(
+            "SELECT role FROM users WHERE id = ?", (session["user_id"],)
+        ).fetchone()
+    if user is None or user["role"] != "admin":
+        abort(403)
+
+
 def login_required(view):
     @wraps(view)
     def wrapped_view(**kwargs):
@@ -697,9 +858,19 @@ def csrf_protect(view):
 def inject_template_context():
     if "_csrf_token" not in session:
         session["_csrf_token"] = secrets.token_urlsafe(32)
+    is_admin = False
+    if session.get("user_id"):
+        with database() as db:
+            row = db.execute(
+                "SELECT role FROM users WHERE id = ?", (session["user_id"],)
+            ).fetchone()
+            is_admin = (
+                row is not None and row["role"] == "admin" and request.is_secure
+            )
     return {
         "csrf_token": session["_csrf_token"],
         "session_username": session.get("username"),
+        "is_admin": is_admin,
     }
 
 
@@ -740,6 +911,13 @@ def register():
             error="비밀번호는 1~100자로 입력해 주세요.",
             next_url="",
         ), 400
+    if username == app.config["ADMIN_USERNAME"]:
+        return render_template_string(
+            AUTH_PAGE,
+            mode="register",
+            error="아이디 '1'은 관리자 계정으로 예약되어 있습니다.",
+            next_url="",
+        ), 409
 
     with database() as db:
         existing_user = db.execute(
@@ -752,12 +930,21 @@ def register():
                 error="이미 사용 중인 아이디입니다.",
                 next_url="",
             ), 409
-        cursor = db.execute(
-            "INSERT INTO users (username, password_hash) VALUES (?, ?)",
-            (username, generate_password_hash(password)),
-        )
+        try:
+            cursor = db.execute(
+                "INSERT INTO users (username, password_hash) VALUES (?, ?)",
+                (username, generate_password_hash(password)),
+            )
+        except sqlite3.IntegrityError:
+            return render_template_string(
+                AUTH_PAGE,
+                mode="register",
+                error="이미 사용 중인 아이디입니다.",
+                next_url="",
+            ), 409
         user_id = cursor.lastrowid
         initialize_user_data(db, user_id)
+        record_activity(db, user_id, "register")
 
     session.clear()
     session["user_id"] = user_id
@@ -788,7 +975,7 @@ def login():
         ), 400
     with database() as db:
         user = db.execute(
-            "SELECT id, username, password_hash FROM users WHERE username = ?",
+            "SELECT id, username, password_hash, role FROM users WHERE username = ?",
             (username,),
         ).fetchone()
     if user is None or not check_password_hash(user["password_hash"], password):
@@ -798,10 +985,15 @@ def login():
             error="아이디 또는 비밀번호를 확인해 주세요.",
             next_url=next_url,
         ), 401
+    if user["role"] == "admin" and not request.is_secure:
+        abort(403, description="관리자 로그인을 위해 HTTPS 연결이 필요합니다.")
 
+    with database() as db:
+        record_activity(db, user["id"], "login")
     session.clear()
     session["user_id"] = user["id"]
     session["username"] = user["username"]
+    session["is_admin"] = user["role"] == "admin"
     return redirect(next_url or url_for("home"))
 
 
@@ -809,6 +1001,8 @@ def login():
 @csrf_protect
 @login_required
 def logout():
+    with database() as db:
+        record_activity(db, session["user_id"], "logout")
     session.clear()
     flash("로그아웃했습니다.")
     return redirect(url_for("login"))
@@ -855,6 +1049,90 @@ def home():
         database_name=Path(app.config["DATABASE"]).name,
         result=request.args.get("result"),
     )
+
+
+@app.route("/admin")
+@login_required
+def admin_dashboard():
+    require_admin()
+    with database() as db:
+        users = db.execute(
+            """
+            SELECT users.id, users.username, users.created_at,
+                   (
+                       SELECT MAX(activity_time)
+                       FROM (
+                           SELECT created_at AS activity_time FROM user_activity
+                           WHERE user_id = users.id
+                           UNION ALL
+                           SELECT created_at AS activity_time FROM user_quiz_attempts
+                           WHERE user_id = users.id
+                       )
+                   ) AS last_activity,
+                   (
+                       SELECT COUNT(*) FROM user_progress
+                       WHERE user_progress.user_id = users.id
+                         AND user_progress.completed = 1
+                   ) AS completed_lessons,
+                   (SELECT COUNT(*) FROM lessons) AS total_lessons,
+                   (
+                       SELECT COUNT(*) FROM user_quiz_attempts
+                       WHERE user_quiz_attempts.user_id = users.id
+                   ) AS attempt_count
+            FROM users
+            ORDER BY users.created_at DESC, users.id DESC
+            """
+        ).fetchall()
+        event_rows = db.execute(
+            """
+            SELECT * FROM (
+                SELECT users.username, user_activity.created_at,
+                       user_activity.event_type, NULL AS lesson_title,
+                       NULL AS difficulty, NULL AS question_position,
+                       NULL AS selected_answer, NULL AS choices_json,
+                       NULL AS is_correct
+                FROM user_activity
+                JOIN users ON users.id = user_activity.user_id
+                UNION ALL
+                SELECT users.username, user_quiz_attempts.created_at,
+                       'quiz' AS event_type, lessons.title AS lesson_title,
+                       lesson_questions.difficulty,
+                       lesson_questions.position AS question_position,
+                       user_quiz_attempts.selected_answer,
+                       lesson_questions.choices_json,
+                       user_quiz_attempts.is_correct
+                FROM user_quiz_attempts
+                JOIN users ON users.id = user_quiz_attempts.user_id
+                LEFT JOIN lessons ON lessons.id = user_quiz_attempts.lesson_id
+                LEFT JOIN lesson_questions
+                  ON lesson_questions.id = user_quiz_attempts.question_id
+            )
+            ORDER BY created_at DESC
+            LIMIT 500
+            """
+        ).fetchall()
+
+    activity_labels = {
+        "register": "가입",
+        "login": "로그인",
+        "logout": "로그아웃",
+        "quiz": "문제 풀이",
+    }
+    events = []
+    for row in event_rows:
+        event = dict(row)
+        event["label"] = activity_labels[event.pop("event_type")]
+        selected_answer = event["selected_answer"]
+        event["selected_choice"] = None
+        if selected_answer is not None and event["choices_json"]:
+            choices = json.loads(event["choices_json"])
+            if 0 <= selected_answer < len(choices):
+                event["selected_choice"] = choices[selected_answer]
+        event.pop("selected_answer")
+        event.pop("choices_json")
+        events.append(event)
+
+    return render_template_string(ADMIN_PAGE, users=users, events=events)
 
 
 @app.route("/lessons/<slug>")
